@@ -4,19 +4,32 @@ from maxapi import Router, F
 from maxapi.types import MessageCreated, MessageCallback
 
 from config import OPERATOR_CHAT_ID, OPERATOR_WORK_HOURS
-from keyboards import main_menu, confirm_send, reply_button
-from database import create_ticket, get_ticket, save_answer_by_ticket
+from keyboards import (
+    main_menu,
+    confirm_send,
+    operator_menu,
+    tickets_list_menu,
+    back_to_operator_menu,
+    cancel_operator_reply,
+    reply_button,
+)
+from database import (
+    create_ticket,
+    get_ticket,
+    save_answer_by_ticket,
+    get_user_history,
+    get_open_tickets,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
 
-# Текст, ожидающий подтверждения: user_id -> текст
-_pending_confirms: dict[int, str] = {}
+# Состояния операторов (in-memory)
+_pending_confirms: dict[int, str] = {}    # user_id → текст, ожидающий подтверждения
+_pending_replies: dict[int, int] = {}     # operator_id → ticket_id (ждём ввод ответа)
+_pending_history: set[int] = set()        # operator_id, ожидающий ввода ID абонента
 
-# Операторы, ожидающие ввода ответа: operator_user_id -> ticket_id
-_pending_replies: dict[int, int] = {}
-
-# Дедупликация
+# Дедупликация входящих
 _processed_mids: set[int] = set()
 _MAX_PROCESSED = 2000
 
@@ -35,8 +48,19 @@ def _get_user_id(event) -> int | None:
     return None
 
 
+def _get_chat_id(event) -> int | None:
+    """Достаёт chat_id, куда пришло сообщение."""
+    msg = getattr(event, "message", None)
+    if msg is None:
+        return None
+    recipient = getattr(msg, "recipient", None)
+    if recipient is None:
+        return None
+    return getattr(recipient, "chat_id", None)
+
+
 # ============================================================
-# Обработка ВХОДЯЩИХ СООБЩЕНИЙ
+# ОБРАБОТКА ВХОДЯЩИХ СООБЩЕНИЙ
 # ============================================================
 
 @router.message_created()
@@ -44,7 +68,7 @@ async def handle_message(event: MessageCreated):
     if not event.message or not event.message.sender:
         return
 
-    # Дедупликация
+    # Дедупликация по mid
     mid = getattr(event.message.body, "mid", None) if event.message.body else None
     if mid is not None:
         if mid in _processed_mids:
@@ -53,24 +77,55 @@ async def handle_message(event: MessageCreated):
         if len(_processed_mids) > _MAX_PROCESSED:
             _processed_mids.clear()
 
-    chat_id = None
-    if event.message.recipient is not None:
-        chat_id = getattr(event.message.recipient, "chat_id", None)
-
+    chat_id = _get_chat_id(event)
     user_id = event.message.sender.user_id
     user_name = event.message.sender.first_name or "—"
     text = (event.message.body.text or "").strip() if event.message.body else ""
 
     is_operator_group = bool(OPERATOR_CHAT_ID and chat_id == OPERATOR_CHAT_ID)
 
-    # === Сообщение из группы операторов ===
+    # ============================================================
+    # ГРУППА ОПЕРАТОРОВ
+    # ============================================================
     if is_operator_group:
-        # В группе принимаем только /reply N текст. Никаких «просто сообщений».
+        # 1. Оператор вводит ID абонента для истории
+        if user_id in _pending_history:
+            if text.isdigit():
+                _pending_history.discard(user_id)
+                await _show_history(event, int(text))
+                return
+            if text.startswith("/"):
+                _pending_history.discard(user_id)
+                # Продолжаем обработку как команды ниже
+            else:
+                await event.message.answer(
+                    "⚠️ Введите ID абонента (только цифры) "
+                    "или отправьте /menu для отмены."
+                )
+                return
+
+        # 2. Команда /menu или /start — показать меню оператора
+        if text.startswith("/menu") or text.startswith("/start"):
+            await event.message.answer(
+                text="🎛 Меню оператора:",
+                attachments=[operator_menu()],
+            )
+            return
+
+        # 3. Оператор в режиме ответа → любое не-командное сообщение = ответ
+        if user_id in _pending_replies and not text.startswith("/"):
+            ticket_id = _pending_replies.pop(user_id)
+            await _deliver_answer(event, ticket_id, text)
+            return
+
+        # 4. Резервные команды /reply N текст и /history N
         await handle_operator_reply(event, text)
         return
 
-    # === Личка с ботом ===
-    # Оператор печатает ответ в личке после клика по кнопке
+    # ============================================================
+    # ЛИЧКА С БОТОМ
+    # ============================================================
+    # Оператор печатает ответ после нажатия кнопки «Ответить»
     if user_id in _pending_replies:
         ticket_id = _pending_replies.pop(user_id)
         await _deliver_answer(event, ticket_id, text)
@@ -94,30 +149,109 @@ async def handle_message(event: MessageCreated):
 
 
 # ============================================================
-# Обработка CALLBACK-КНОПОК
+# ОБРАБОТКА CALLBACK-КНОПОК
 # ============================================================
 
 @router.message_callback(
     (F.callback.payload == "confirm_send")
     | (F.callback.payload == "cancel_send")
     | F.callback.payload.startswith("reply:")
+    | F.callback.payload.startswith("op_")
 )
 async def handle_callback(event: MessageCallback):
     payload = event.callback.payload
     logger.info("Operator callback payload=%r", payload)
 
-    # Кнопка ответа в группе операторов
+    operator_id = _get_user_id(event)
+
+    # ---------- МЕНЮ ОПЕРАТОРА ----------
+
+    if payload == "op_refresh":
+        await event.edit(
+            text="🎛 Меню оператора:",
+            attachments=[operator_menu()],
+        )
+        return
+
+    if payload == "op_list_tickets":
+        tickets = get_open_tickets(limit=20)
+        if not tickets:
+            await event.edit(
+                text="📋 Открытых тикетов нет.",
+                attachments=[back_to_operator_menu()],
+            )
+            return
+        await event.edit(
+            text=f"📋 Открытые тикеты: {len(tickets)}",
+            attachments=[tickets_list_menu(tickets)],
+        )
+        return
+
+    if payload == "op_history_prompt":
+        if operator_id is not None:
+            _pending_history.add(operator_id)
+        await event.edit(
+            text=(
+                "📜 Введите ID абонента для просмотра истории.\n\n"
+                "Например: 193110397\n\n"
+                "Для отмены отправьте /menu."
+            ),
+            attachments=[back_to_operator_menu()],
+        )
+        return
+
+    if payload == "op_cancel_reply":
+        if operator_id is not None:
+            _pending_replies.pop(operator_id, None)
+        await event.edit(
+            text="❌ Ввод ответа отменён.",
+            attachments=[back_to_operator_menu()],
+        )
+        return
+
+    # ---------- ОТВЕТ НА ТИКЕТ ----------
+
     if payload.startswith("reply:"):
-        await handle_reply_button(event)
+        if operator_id is None:
+            return
+        try:
+            ticket_id = int(payload.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+
+        ticket = get_ticket(ticket_id)
+        if ticket is None:
+            await event.edit(text=f"⚠️ Тикет #{ticket_id} не найден в базе.")
+            return
+        if ticket["status"] == "answered":
+            await event.edit(
+                text=f"⚠️ По тикету #{ticket_id} уже отправлен ответ "
+                     f"({ticket['answered_at']})."
+            )
+            return
+
+        _pending_replies[operator_id] = ticket_id
+
+        await event.edit(
+            text=(
+                f"✍️ Тикет #{ticket_id}\n"
+                f"Абонент: {ticket.get('user_name') or '—'} "
+                f"(ID {ticket['user_id']})\n"
+                f"Вопрос: {ticket['question']}\n\n"
+                f"Введите текст ответа следующим сообщением "
+                f"или нажмите «Отменить»."
+            ),
+            attachments=[cancel_operator_reply()],
+        )
         return
 
-    user_id = _get_user_id(event)
-    if user_id is None:
+    # ---------- ПОДТВЕРЖДЕНИЕ ОТПРАВКИ ВОПРОСА (ЛИЧКА АБОНЕНТА) ----------
+
+    if operator_id is None:
         return
 
-    # Подтверждение отправки вопроса
     if payload == "confirm_send":
-        text = _pending_confirms.pop(user_id, None)
+        text = _pending_confirms.pop(operator_id, None)
         if not text:
             await event.edit(
                 text="⌛ Сообщение устарело. Напишите вопрос заново.",
@@ -129,12 +263,12 @@ async def handle_callback(event: MessageCallback):
         if event.callback and getattr(event.callback, "user", None):
             user_name = getattr(event.callback.user, "first_name", None) or "—"
 
-        ticket_id = create_ticket(user_id, user_name, text)
-        logger.info("Создан тикет #%s от %s (%s)", ticket_id, user_id, user_name)
+        ticket_id = create_ticket(operator_id, user_name, text)
+        logger.info("Создан тикет #%s от %s (%s)", ticket_id, operator_id, user_name)
 
         operator_message = (
             f"📩 Новый вопрос от абонента (#{ticket_id})\n"
-            f"ID абонента: {user_id}\n"
+            f"ID абонента: {operator_id}\n"
             f"Имя: {user_name}\n"
             f"---\n{text}"
         )
@@ -160,7 +294,7 @@ async def handle_callback(event: MessageCallback):
         return
 
     if payload == "cancel_send":
-        _pending_confirms.pop(user_id, None)
+        _pending_confirms.pop(operator_id, None)
         await event.edit(
             text="Отменено. Выберите тему или напишите новый вопрос.",
             attachments=[main_menu()],
@@ -183,20 +317,17 @@ async def _deliver_answer(event, ticket_id: int, answer_text: str):
 
     ticket = get_ticket(ticket_id)
     if ticket is None:
-        logger.warning("Тикет #%s не найден в БД", ticket_id)
         await event.message.answer(f"⚠️ Тикет #{ticket_id} не найден в базе.")
         return
 
     if ticket["status"] == "answered":
-        logger.info("Тикет #%s уже закрыт (%s)", ticket_id, ticket["answered_at"])
         await event.message.answer(
             f"⚠️ По тикету #{ticket_id} уже был отправлен ответ "
-            f"({ticket['answered_at']}). Повторная отправка не выполнена."
+            f"({ticket['answered_at']})."
         )
         return
 
     target_user_id = ticket["user_id"]
-    logger.info("Тикет #%s → user_id=%s, отправляю ответ", ticket_id, target_user_id)
 
     try:
         await event.bot.send_message(
@@ -208,9 +339,14 @@ async def _deliver_answer(event, ticket_id: int, answer_text: str):
             ),
             attachments=[main_menu()],
         )
-        logger.info("Ответ доставлен абоненту %s по тикету #%s", target_user_id, ticket_id)
+        logger.info(
+            "Ответ доставлен абоненту %s по тикету #%s",
+            target_user_id, ticket_id,
+        )
     except Exception as e:
-        logger.exception("Не удалось отправить ответ абоненту %s: %s", target_user_id, e)
+        logger.exception(
+            "Не удалось отправить ответ абоненту %s: %s", target_user_id, e
+        )
         await event.message.answer(
             f"⚠️ Не удалось отправить ответ абоненту {target_user_id}.\n"
             f"Ошибка: {e}"
@@ -221,71 +357,89 @@ async def _deliver_answer(event, ticket_id: int, answer_text: str):
     if ok:
         logger.info("Тикет #%s закрыт в БД", ticket_id)
         await event.message.answer(
-            f"✅ Ответ по тикету #{ticket_id} отправлен абоненту {target_user_id}."
+            f"✅ Ответ по тикету #{ticket_id} отправлен абоненту {target_user_id}.",
+            attachments=[back_to_operator_menu()],
         )
     else:
-        logger.warning("Не удалось обновить тикет #%s в БД", ticket_id)
         await event.message.answer(
             f"⚠️ Ответ отправлен, но не удалось обновить тикет #{ticket_id} в БД."
         )
 
 
+async def _show_history(event, target_user_id: int):
+    """Показывает историю обращений абонента."""
+    history = get_user_history(target_user_id, limit=5)
+    if not history:
+        await event.message.answer(
+            text=f"📋 По абоненту {target_user_id} обращений не найдено.",
+            attachments=[back_to_operator_menu()],
+        )
+        return
+
+    lines = [f"📋 История обращений абонента {target_user_id}:\n"]
+    for t in history:
+        icon = "✅" if t["status"] == "answered" else "⏳"
+        lines.append(f"{icon} #{t['id']} | {t['created_at']}")
+        lines.append(f"Вопрос: {t['question']}")
+        if t.get("answer"):
+            lines.append(f"Ответ: {t['answer']}")
+            lines.append(f"Закрыт: {t['answered_at']}")
+        else:
+            lines.append("Статус: ожидает ответа")
+        lines.append("")
+
+    full_text = "\n".join(lines)
+    max_len = 3500
+
+    if len(full_text) <= max_len:
+        await event.message.answer(
+            text=full_text,
+            attachments=[back_to_operator_menu()],
+        )
+        return
+
+    # Разбиваем длинное сообщение на части
+    chunks = [full_text[i:i + max_len] for i in range(0, len(full_text), max_len)]
+    for chunk in chunks[:-1]:
+        await event.message.answer(text=chunk)
+    await event.message.answer(
+        text=chunks[-1],
+        attachments=[back_to_operator_menu()],
+    )
+
+
 async def handle_operator_reply(event: MessageCreated, text: str):
-    """Резервный вариант: /reply <ticket_id> <текст>."""
+    """Резервные команды: /reply N текст и /history N. Основной интерфейс — кнопки."""
+    # /history N
+    if text.startswith("/history"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip().isdigit():
+            await event.message.answer(
+                "📜 Формат: /history <ID абонента>.\n"
+                "Либо воспользуйтесь меню: /menu."
+            )
+            return
+        await _show_history(event, int(parts[1].strip()))
+        return
+
+    # /reply N текст
     if not text.startswith("/reply"):
         return
 
     parts = text.split(maxsplit=2)
     if len(parts) < 3:
         await event.message.answer(
-            "⚠️ Формат: /reply <номер тикета> <текст ответа>."
+            "⚠️ Формат: /reply <номер тикета> <текст ответа>.\n"
+            "Либо воспользуйтесь меню: /menu."
         )
         return
 
     try:
         ticket_id = int(parts[1])
     except ValueError:
-        await event.message.answer(f"⚠️ Номер тикета должен быть числом: {parts[1]}")
+        await event.message.answer(
+            f"⚠️ Номер тикета должен быть числом: {parts[1]}"
+        )
         return
 
     await _deliver_answer(event, ticket_id, parts[2].strip())
-
-
-async def handle_reply_button(event: MessageCallback):
-    """Нажатие кнопки '✍️ Ответить на #N' в группе операторов."""
-    operator_id = _get_user_id(event)
-    if operator_id is None:
-        return
-
-    payload = event.callback.payload  # "reply:6"
-    try:
-        ticket_id = int(payload.split(":", 1)[1])
-    except (ValueError, IndexError):
-        return
-
-    _pending_replies[operator_id] = ticket_id
-
-    try:
-        await event.bot.send_message(
-            user_id=operator_id,
-            text=(
-                f"✍️ Введите текст ответа для тикета #{ticket_id}.\n\n"
-                f"Просто отправьте сообщение сюда — оно будет доставлено абоненту."
-            ),
-        )
-        # Сообщаем в группу
-        await event.bot.send_message(
-            chat_id=OPERATOR_CHAT_ID,
-            text=f"📩 Оператору отправлено личное сообщение для ввода ответа по #{ticket_id}.",
-        )
-    except Exception as e:
-        logger.exception("Не удалось написать оператору %s: %s", operator_id, e)
-        _pending_replies.pop(operator_id, None)
-        await event.bot.send_message(
-            chat_id=OPERATOR_CHAT_ID,
-            text=(
-                f"⚠️ Не удалось отправить личное сообщение оператору.\n"
-                f"Скорее всего, оператор ещё не начинал чат с ботом в личке.\n"
-                f"Откройте бота в личке, нажмите /start и попробуйте снова."
-            ),
-        )

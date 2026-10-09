@@ -73,11 +73,22 @@ def save_answer_by_ticket(ticket_id: int, answer: str) -> bool:
         )
         return True
 
+
 def get_user_history(user_id: int, limit: int = 5) -> list[dict]:
-    """Последние N тикетов пользователя (на будущее — для команды /history)."""
+    """Последние N тикетов пользователя."""
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM tickets WHERE user_id = ? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_open_tickets(limit: int = 20) -> list[dict]:
+    """Все открытые тикеты (status='new'), самые свежие сверху."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tickets WHERE status = 'new' ORDER BY id DESC LIMIT ?",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]

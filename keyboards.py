@@ -2,11 +2,15 @@ from maxapi.types import CallbackButton
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 
 
+# ============================================================
+# МЕНЮ АБОНЕНТА (личка с ботом)
+# ============================================================
+
 def main_menu():
-    """Главное меню бота."""
+    """Главное меню бота для абонента."""
     builder = InlineKeyboardBuilder()
     builder.row(
-        CallbackButton(text="📖 Справочник", payload="open_reference"),
+        CallbackButton(text="📚 Справочник", payload="open_reference"),
     )
     builder.row(
         CallbackButton(text="📞 Задать вопрос оператору", payload="contact_operator"),
@@ -70,10 +74,74 @@ def confirm_send():
     return builder.as_markup()
 
 
+# ============================================================
+# ГРУППА ОПЕРАТОРОВ
+# ============================================================
+
+def operator_menu():
+    """Главное меню группы операторов."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        CallbackButton(text="📋 Открытые тикеты", payload="op_list_tickets"),
+        CallbackButton(text="📜 История абонента", payload="op_history_prompt"),
+    )
+    builder.row(
+        CallbackButton(text="🔄 Обновить меню", payload="op_refresh"),
+    )
+    return builder.as_markup()
+
+
 def reply_button(ticket_id: int):
     """Кнопка 'Ответить' под заявкой в группе операторов."""
     builder = InlineKeyboardBuilder()
     builder.row(
         CallbackButton(text=f"✍️ Ответить на #{ticket_id}", payload=f"reply:{ticket_id}"),
+    )
+    return builder.as_markup()
+
+
+def tickets_list_menu(tickets: list[dict]):
+    """Меню со списком открытых тикетов.
+
+    Для каждого тикета — своя кнопка «Ответить» и «История».
+    Плюс кнопка возврата в меню операторов.
+    """
+    builder = InlineKeyboardBuilder()
+
+    for t in tickets:
+        ticket_id = t["id"]
+        user_name = t.get("user_name") or "—"
+        # Обрезаем длинный вопрос для кнопки
+        question = (t.get("question") or "").strip().replace("\n", " ")
+        short_q = question[:40] + "…" if len(question) > 40 else question
+
+        builder.row(
+            CallbackButton(
+                text=f"✍️ #{ticket_id} | {user_name}: {short_q}",
+                payload=f"reply:{ticket_id}",
+            ),
+        )
+
+    builder.row(
+        CallbackButton(text="🔄 Обновить список", payload="op_list_tickets"),
+    )
+    builder.row(
+        CallbackButton(text="◀️ В меню операторов", payload="op_refresh"),
+    )
+    return builder.as_markup()
+
+
+def back_to_operator_menu():
+    """Кнопка возврата в меню операторов."""
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="◀️ В меню операторов", payload="op_refresh"))
+    return builder.as_markup()
+
+
+def cancel_operator_reply():
+    """Кнопка отмены ввода ответа оператором."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        CallbackButton(text="❌ Отменить ответ", payload="op_cancel_reply"),
     )
     return builder.as_markup()
