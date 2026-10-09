@@ -126,10 +126,20 @@ async def handle_message(event: MessageCreated):
     # ЛИЧКА С БОТОМ
     # ============================================================
     # Оператор печатает ответ после нажатия кнопки «Ответить»
-    if user_id in _pending_replies:
-        ticket_id = _pending_replies.pop(user_id)
-        await _deliver_answer(event, ticket_id, text)
-        return
+    if user_id in _pending_history:
+        logger.info("Оператор %s вводит ID абонента: %r", user_id, text)
+        if text.isdigit():
+            _pending_history.discard(user_id)
+            await _show_history(event, int(text))
+            return
+        if text.startswith("/"):
+            _pending_history.discard(user_id)
+        else:
+            await event.message.answer(
+                "⚠️ Введите ID абонента (только цифры) "
+                "или отправьте /menu для отмены."
+            )
+            return
 
     # Абонент пишет текст → предлагаем отправить оператору
     if not text or text.startswith("/"):
@@ -368,7 +378,11 @@ async def _deliver_answer(event, ticket_id: int, answer_text: str):
 
 async def _show_history(event, target_user_id: int):
     """Показывает историю обращений абонента."""
+    logger.info("_show_history: запрос истории по user_id=%s", target_user_id)
+
     history = get_user_history(target_user_id, limit=5)
+    logger.info("Найдено %d записей", len(history))
+
     if not history:
         await event.message.answer(
             text=f"📋 По абоненту {target_user_id} обращений не найдено.",
@@ -396,9 +410,9 @@ async def _show_history(event, target_user_id: int):
             text=full_text,
             attachments=[back_to_operator_menu()],
         )
+        logger.info("История отправлена одним сообщением")
         return
 
-    # Разбиваем длинное сообщение на части
     chunks = [full_text[i:i + max_len] for i in range(0, len(full_text), max_len)]
     for chunk in chunks[:-1]:
         await event.message.answer(text=chunk)
@@ -406,6 +420,7 @@ async def _show_history(event, target_user_id: int):
         text=chunks[-1],
         attachments=[back_to_operator_menu()],
     )
+    logger.info("История отправлена %d сообщениями", len(chunks))
 
 
 async def handle_operator_reply(event: MessageCreated, text: str):
